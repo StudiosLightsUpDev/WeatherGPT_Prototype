@@ -2,18 +2,75 @@ from flask import Flask, request, jsonify, render_template_string
 import requests
 import webbrowser
 import threading
+import time
 
 
 app = Flask(__name__)
+
+
+# ============================================================
+# SHARED HTTP HELPER: retry-with-backoff + short-lived cache
+# ============================================================
+# Open-Meteo's free tier can return 429 (Too Many Requests) under
+# shared-IP load (e.g. on Render's free plan). A quick retry clears
+# most transient throttles, and caching identical lookups for a few
+# minutes cuts down how often we hit the API at all.
+
+_response_cache = {}
+_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+
+def _cache_key(url, params):
+    # Round coordinates to ~100m precision so nearby repeat requests
+    # (e.g. the same visitor's browser retrying) share a cache entry.
+    rounded = {}
+    for k, v in (params or {}).items():
+        if k in ("latitude", "longitude") and isinstance(v, (int, float)):
+            rounded[k] = round(v, 3)
+        else:
+            rounded[k] = v
+    return url + "?" + "&".join(f"{k}={rounded[k]}" for k in sorted(rounded))
+
+
+def get_json_with_retry(url, params=None, timeout=10, retries=2, backoff_seconds=1.5):
+    """GET a JSON endpoint with a short cache and retry-with-backoff on 429s."""
+    key = _cache_key(url, params)
+    cached = _response_cache.get(key)
+    if cached and (time.time() - cached["ts"]) < _CACHE_TTL_SECONDS:
+        return cached["data"]
+
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            response = requests.get(url, params=params, timeout=timeout)
+            if response.status_code == 429 and attempt < retries:
+                time.sleep(backoff_seconds * (attempt + 1))
+                continue
+            response.raise_for_status()
+            data = response.json()
+            _response_cache[key] = {"data": data, "ts": time.time()}
+            return data
+        except requests.exceptions.HTTPError as error:
+            last_error = error
+            if response is not None and response.status_code == 429 and attempt < retries:
+                time.sleep(backoff_seconds * (attempt + 1))
+                continue
+            raise
+        except Exception as error:
+            last_error = error
+            raise
+    if last_error:
+        raise last_error
+    return None
+
 
 def get_air_quality(latitude, longitude):
     """Fetch current AQI and particulate matter for wellness advisories."""
     try:
         url = "https://air-quality-api.open-meteo.com/v1/air-quality"
         params = {"latitude": latitude, "longitude": longitude, "current": "us_aqi,pm2_5,pm10", "timezone": "auto"}
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        current = r.json().get("current", {})
+        data = get_json_with_retry(url, params=params, timeout=10)
+        current = data.get("current", {})
         return {"aqi": current.get("us_aqi"), "pm2_5": current.get("pm2_5"), "pm10": current.get("pm10")}
     except Exception as error:
         print("Air Quality API Error:", error)
@@ -38,13 +95,11 @@ def get_weather(city):
             "format": "json"
         }
 
-        geo_response = requests.get(
+        geo_data = get_json_with_retry(
             geo_url,
             params=geo_params,
             timeout=10
         )
-
-        geo_data = geo_response.json()
 
         if "results" not in geo_data or not geo_data["results"]:
             return None
@@ -78,13 +133,11 @@ def get_weather(city):
             "timezone": "auto"
         }
 
-        weather_response = requests.get(
+        weather_data = get_json_with_retry(
             weather_url,
             params=weather_params,
             timeout=10
         )
-
-        weather_data = weather_response.json()
         current = weather_data["current"]
 
         weather_codes = {
@@ -166,9 +219,7 @@ def get_weather_by_coordinates(latitude, longitude, label="Current Location"):
             "timezone": "auto"
         }
 
-        response = requests.get(weather_url, params=weather_params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        data = get_json_with_retry(weather_url, params=weather_params, timeout=10)
         current = data["current"]
 
         weather_codes = {
@@ -315,9 +366,7 @@ def geocode_destination(destination):
             "country_code": "IN"
         }
 
-        response = requests.get(geo_url, params=geo_params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        data = get_json_with_retry(geo_url, params=geo_params, timeout=10)
 
         results = data.get("results") or []
         if not results:
