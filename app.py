@@ -5663,6 +5663,15 @@ def home():
 
 
 # ============================================================
+# HEALTH CHECK (used by Render to keep the service up)
+# ============================================================
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"}), 200
+
+
+# ============================================================
 # CHAT
 # ============================================================
 
@@ -5868,6 +5877,11 @@ def open_browser():
 
 if __name__ == "__main__":
 
+    import os
+
+    port = int(os.environ.get("PORT", 5000))
+    is_render = bool(os.environ.get("RENDER"))
+
     print()
     print("=" * 55)
     print("       🌦️ WEATHERGPT")
@@ -5878,17 +5892,18 @@ if __name__ == "__main__":
     print("🤖 AI Assistant: ON")
     print("🎤 Voice Assistant: ON")
     print()
-    print("🌐 http://127.0.0.1:5000")
+    print(f"🌐 Listening on port {port}")
     print()
     print("=" * 55)
 
-    threading.Timer(
-        1.5,
-        open_browser
-    ).start()
+    if not is_render:
+        threading.Timer(
+            1.5,
+            open_browser
+        ).start()
 
     app.run(
-        host="127.0.0.1",
-        port=5000,
+        host="0.0.0.0",
+        port=port,
         debug=False
     )
